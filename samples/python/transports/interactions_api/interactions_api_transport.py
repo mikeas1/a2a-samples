@@ -5,9 +5,11 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
+from a2a.client import ClientConfig, ClientFactory
 from a2a.client.errors import A2AClientJSONRPCError
 from a2a.client.middleware import ClientCallContext
 from a2a.client.transports import ClientTransport
+from a2a.extensions.common import find_extension_by_uri
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
@@ -38,135 +40,74 @@ from a2a.types import (
 )
 
 
-class AgentInteraction:
-    """Configuration container for the agent interaction settings."""
-
-    agent: str | None = None
-    dynamic_config: dict[str, Any] | None = None
-    deep_research_config: dict[str, Any] | None = None
-
-    def __init__(
-        self,
-        agent: str | None = None,
-        dynamic_config: dict[str, Any] | None = None,
-        deep_research_config: dict[str, Any] | None = None,
-    ):
-        self.agent = agent
-        self.dynamic_config = dynamic_config
-        self.deep_research_config = deep_research_config
-
-    def to_dict(self) -> dict[str, Any]:
-        result = {}
-        if self.agent:
-            result['agent'] = self.agent
-        if self.dynamic_config:
-            result['dynamic_config'] = self.dynamic_config
-        if self.deep_research_config:
-            result['deep_research_config'] = self.deep_research_config
-        return result
-
-
 # --- Mapping Functions (Dict-based) ---
 
 
-def _a2a_part_to_interaction_content(part: Part) -> dict[str, Any]:
+def _part_to_content(part: Part) -> dict[str, Any]:
     """Maps an A2A Part object to an Interactions API Content dictionary."""
-    # Access the actual part from the RootModel
-    actual_part = part.root
-
-    if isinstance(actual_part, TextPart):
-        return {
-            'text': {
-                'text': actual_part.text,
-                'annotations': actual_part.metadata.get('annotations', []) if actual_part.metadata else [],
-            }
-        }
-    elif isinstance(actual_part, FilePart):
+    if isinstance(part.root, TextPart):
+        content = {'text': part.root.text}
+        if part.root.metadata and (annotations := part.root.metadata.get('annotations')):
+            content['annotations'] = annotations
+        return {'text': content}
+    elif isinstance(part.root, FilePart):
         mime_type = None
         blob_content = {}
 
-        if isinstance(actual_part.file, FileWithBytes):
-            blob_content['data'] = actual_part.file.bytes
-            mime_type = actual_part.file.mime_type
-        elif isinstance(actual_part.file, FileWithUri):
-            blob_content['uri'] = actual_part.file.uri
-            mime_type = actual_part.file.mime_type
+        if isinstance(part.root.file, FileWithBytes):
+            blob_content['data'] = part.root.file.bytes
+            mime_type = part.root.file.mime_type
+        elif isinstance(part.root.file, FileWithUri):
+            blob_content['uri'] = part.root.file.uri
+            mime_type = part.root.file.mime_type
 
-        if mime_type:
-            blob_content['mime_type'] = mime_type
-
-        if actual_part.metadata:
-            resolution = actual_part.metadata.get('resolution')
+        if part.root.metadata:
+            resolution = part.root.metadata.get('resolution')
             if resolution:
                 blob_content['resolution'] = resolution
 
-        if mime_type and mime_type.startswith('image'):
-            return {'image': blob_content}
-        elif mime_type and mime_type.startswith('audio'):
-            return {'audio': blob_content}
-        elif mime_type and mime_type.startswith('application/pdf'):
-            return {'document': blob_content}
-        elif mime_type and mime_type.startswith('video'):
-            return {'video': blob_content}
-        else:
-            raise A2AClientJSONRPCError(
-                JSONRPCErrorResponse(
-                    error=ContentTypeNotSupportedError(
-                        message=f'Unsupported file MIME type for Interactions API mapping: {mime_type}'
-                    )
-                )
-            )
-
-    elif isinstance(actual_part, DataPart):
-        if 'function_call' in actual_part.data:
-            func_call = actual_part.data['function_call']
-            return {'function': {'functionCall': {'name': func_call['name'], 'arguments': func_call['args']}}}
-        elif 'function_response' in actual_part.data:
-            func_response = actual_part.data['function_response']
-            # Simplified mapping: stringify the response
-            return {
-                'functionResponse': {
-                    'functionResult': {'stringResult': json.dumps(func_response['response']), 'is_error': False}
-                }
-            }
-        elif 'thought' in actual_part.data:
-            thought_data = actual_part.data['thought']
-            if isinstance(thought_data, str):
-                return {'thought': {'summary': {'items': [{'text': {'text': thought_data}}]}}}
+        if mime_type:
+            blob_content['mime_type'] = mime_type
+            if mime_type.startswith('image'):
+                return {'image': blob_content}
+            elif mime_type.startswith('audio'):
+                return {'audio': blob_content}
+            elif mime_type.startswith('application/pdf'):
+                return {'document': blob_content}
+            elif mime_type.startswith('video'):
+                return {'video': blob_content}
             else:
                 raise A2AClientJSONRPCError(
                     JSONRPCErrorResponse(
                         error=ContentTypeNotSupportedError(
-                            message='Complex thought DataPart not yet supported for Interactions API mapping.'
+                            message=f'Unsupported file MIME type for Interactions API mapping: {mime_type}'
                         )
                     )
                 )
-        else:
-            raise A2AClientJSONRPCError(
-                JSONRPCErrorResponse(
-                    error=ContentTypeNotSupportedError(
-                        message=f'Unsupported DataPart type for Interactions API mapping: {actual_part.data.keys()}'
-                    )
-                )
-            )
+
+    elif isinstance(part.root, DataPart):
+        return {'text': {'text': json.dumps(part.root.data)}}
 
     raise A2AClientJSONRPCError(
         JSONRPCErrorResponse(
             error=ContentTypeNotSupportedError(
-                message=f'Unsupported A2A Part type for Interactions API mapping: {type(actual_part)}'
+                message=f'Unsupported A2A Part type for Interactions API mapping: {type(part.root)}'
             )
         )
     )
 
 
-def _a2a_message_to_interaction_input(message: Message, agent_interaction: AgentInteraction) -> dict[str, Any]:
+def _a2a_message_to_interaction_input(message: Message, agent_interaction: dict[str, Any]) -> dict[str, Any]:
     """Maps an A2A Message to the input structure for creating an Interaction."""
+    interaction_data = {
+        'contentList': {'contents': [_part_to_content(p) for p in message.parts]},
+    }
+    if message.task_id:
+        interaction_data['previousInteractionId'] = message.task_id
+
     interaction_input = {
-        'interaction': {
-            'contentList': {'contents': [_a2a_part_to_interaction_content(p) for p in message.parts]},
-            'previousInteractionId': message.task_id,
-        },
-        'agentInteraction': agent_interaction.to_dict(),
+        'interaction': interaction_data,
+        'agentInteraction': agent_interaction,
     }
     return interaction_input
 
@@ -185,8 +126,8 @@ def _interaction_status_to_a2a_task_state(status_str: str) -> TaskState:
 
 
 
-def _map_interaction_thought_to_a2a_message(thought_content: dict[str, Any]) -> Message:
-    """Maps Interactions API thought content to an A2A Message."""
+def _thought_to_message(thought_content: dict[str, Any]) -> Message:
+    """Maps an Interactions API thought content to an A2A Message."""
     thought_parts: list[Part] = []
     summary = thought_content.get('summary', {})
     items = summary.get('items', [])
@@ -254,14 +195,6 @@ def _map_interactions_api_content_to_a2a_part(
         func_res_wrapper = content['functionResponse']
         # Handles functionResult wrapper if present
         func_res_data = func_res_wrapper.get('functionResult', func_res_wrapper)
-
-        if 'contentList' in func_res_data:
-            # Stringify content list for now
-            contents = func_res_data['contentList'].get('contents', [])
-            return Part(root=TextPart(text=f'Function Result: {json.dumps(contents)}'))
-        elif 'stringResult' in func_res_data:
-            return Part(root=TextPart(text=f'Function Result: {func_res_data["stringResult"]}'))
-
         return Part(root=DataPart(data={'function_response': func_res_data}))
 
     raise A2AClientJSONRPCError(
@@ -280,56 +213,10 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
     status_str = status_obj.get('status', 'UNSPECIFIED')
     task_status_state = _interaction_status_to_a2a_task_state(status_str)
 
-    task_status_message: Message | None = None
-
-    # Error handling
-    error_obj = interaction.get('error') or status_obj.get('error')
-    if error_obj:
-        task_status_message = Message(
-            message_id=str(uuid.uuid4()),
-            role=Role.agent,
-            parts=[Part(root=TextPart(text=json.dumps(error_obj)))],
-        )
-    # Check for thoughts in outputs to use as status message
-    elif interaction.get('outputs'):
-        for output_content in interaction['outputs']:
-            if 'thought' in output_content:
-                thought = output_content['thought']
-                items = thought.get('summary', {}).get('items', [])
-                for item in items:
-                    if 'text' in item:
-                        task_status_message = Message(
-                            message_id=str(uuid.uuid4()),
-                            role=Role.agent,
-                            parts=[Part(root=TextPart(text=item['text'].get('text', '')))],
-                        )
-                        break
-                if task_status_message:
-                    break
-
-    a2a_artifacts = []
-    outputs = interaction.get('outputs', [])
-    for output_content in outputs:
-        if 'thought' in output_content:
-            continue
-        try:
-            a2a_part = _map_interactions_api_content_to_a2a_part(output_content)
-            a2a_artifacts.append(
-                Artifact(
-                    artifact_id=str(uuid.uuid4()),
-                    parts=[a2a_part],
-                    name='artifact',
-                    metadata={},
-                )
-            )
-        except A2AClientJSONRPCError as e:
-            print(f'Warning: Skipping unsupported content type: {e}')
-            continue
-
     a2a_history = []
     turn_list = interaction.get('turnList', {}).get('turns', [])
 
-    for turn in turn_list:
+    for i, turn in enumerate(turn_list):
         turn_role = Role.user if turn.get('role') == 'user' else Role.agent
         a2a_message_parts = []
 
@@ -347,12 +234,57 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
         if a2a_message_parts:
             a2a_history.append(
                 Message(
-                    message_id=str(uuid.uuid4()),
+                    message_id=f'{task_id}_turn_{i}',
                     role=turn_role,
                     parts=a2a_message_parts,
                     task_id=task_id,
                 )
             )
+
+    a2a_artifacts = []
+    thought_messages = []
+    outputs = interaction.get('outputs', [])
+    
+    for i, output_content in enumerate(outputs):
+        if 'thought' in output_content:
+            try:
+                thought_msg = _thought_to_message(output_content['thought'])
+                thought_msg.message_id = f'{task_id}_thought_{i}'
+                thought_msg.task_id = task_id
+                thought_messages.append(thought_msg)
+            except A2AClientJSONRPCError:
+                continue
+        else:
+            try:
+                a2a_part = _map_interactions_api_content_to_a2a_part(output_content)
+                a2a_artifacts.append(
+                    Artifact(
+                        artifact_id=f'{task_id}_output_{i}',
+                        parts=[a2a_part],
+                        name=f'output-{i}',
+                        metadata={},
+                    )
+                )
+            except A2AClientJSONRPCError as e:
+                print(f'Warning: Skipping unsupported content type: {e}')
+                continue
+
+    # Append thoughts to history
+    a2a_history.extend(thought_messages)
+
+    # Determine status message
+    task_status_message: Message | None = None
+    if thought_messages:
+        task_status_message = thought_messages[-1]
+
+    # Error handling overrides thought status
+    error_obj = interaction.get('error') or status_obj.get('error')
+    if error_obj:
+        task_status_message = Message(
+            message_id=str(uuid.uuid4()),
+            role=Role.agent,
+            parts=[Part(root=TextPart(text=json.dumps(error_obj)))],
+        )
 
     return Task(
         id=task_id,
@@ -367,13 +299,20 @@ class InteractionsApiTransport(ClientTransport):
     INTERACTIONS_API_VERSION = 'v1beta'
     EXTENSION_URI = 'https://generativelanguage.googleapis.com/v1beta/a2a'
 
-    _WELL_KNOWN_AGENTS: dict[str, dict[str, Any]] = {
+    _WELL_KNOWN_AGENTS_INTERACTION_CONFIG: dict[str, dict[str, Any]] = {
         'deep-research-preview': {
             'deep_research_config': {
                 'thinking_summaries': 'THINK_SUMMARIES_AUTO',
             },
         },
     }
+    _WELL_KNOWN_AGENTS_NAMES: dict[str, str] = {
+        'deep-research-preview': 'Deep Research Preview',
+    }
+    _WELL_KNOWN_AGENTS_DESCRIPTIONS: dict[str, str] = {
+        'deep-research-preview': 'Agent powered by Google Deep Research Preview',
+    }
+    _WELL_KNOWN_AGENTS_SKILLS: dict[str, list[str]] = {}
 
     def __init__(self, card: AgentCard, api_key: str | None = None):
         self._card = card
@@ -389,17 +328,16 @@ class InteractionsApiTransport(ClientTransport):
         self._client.headers['x-goog-api-key'] = self._api_key
 
         # Extract agent_interaction from AgentCard extension
-        # We manually look for the extension in capabilities since helpers are not available
-        self._agent_interaction = AgentInteraction()
-        if self._card.capabilities.extensions:
-            for ext in self._card.capabilities.extensions:
-                if ext.uri == self.EXTENSION_URI and ext.params:
-                    self._agent_interaction = AgentInteraction(
-                        agent=ext.params.get('agent'),
-                        dynamic_config=ext.params.get('dynamic_config'),
-                        deep_research_config=ext.params.get('deep_research_config'),
-                    )
-                    break
+        self._agent_interaction: dict[str, Any] = {}
+        if extension := find_extension_by_uri(self._card.capabilities.extensions, self.EXTENSION_URI):
+             if extension.params:
+                # Filter strictly for known fields if necessary, or just copy params
+                if 'agent' in extension.params:
+                    self._agent_interaction['agent'] = extension.params['agent']
+                if 'dynamic_config' in extension.params:
+                    self._agent_interaction['dynamic_config'] = extension.params['dynamic_config']
+                if 'deep_research_config' in extension.params:
+                    self._agent_interaction['deep_research_config'] = extension.params['deep_research_config']
 
         # Internal state for streaming responses
         self._streaming_tasks: dict[str, Task] = {}
@@ -413,23 +351,17 @@ class InteractionsApiTransport(ClientTransport):
         agent_card_overrides: dict[str, Any] | None = None,
     ) -> AgentCard:
         # Start with well-known agent config if applicable
-        final_agent_config = cls._WELL_KNOWN_AGENTS.get(agent_name, {}).copy()
+        final_agent_config = cls._WELL_KNOWN_AGENTS_INTERACTION_CONFIG.get(agent_name, {}).copy()
         if agent_config:
             final_agent_config.update(agent_config)
 
-        agent_interaction = AgentInteraction(
-            agent=agent_name,
-            dynamic_config=final_agent_config.get('dynamic_config'),
-            deep_research_config=final_agent_config.get('deep_research_config'),
-        )
-
-        ext_params = {}
-        if agent_interaction.agent:
-            ext_params['agent'] = agent_interaction.agent
-        if agent_interaction.dynamic_config:
-            ext_params['dynamic_config'] = agent_interaction.dynamic_config
-        if agent_interaction.deep_research_config:
-            ext_params['deep_research_config'] = agent_interaction.deep_research_config
+        agent_interaction: dict[str, Any] = {
+            'agent': agent_name,
+        }
+        if dynamic_config := final_agent_config.get('dynamic_config'):
+            agent_interaction['dynamic_config'] = dynamic_config
+        if deep_research_config := final_agent_config.get('deep_research_config'):
+            agent_interaction['deep_research_config'] = deep_research_config
 
         # Default AgentCard values
         card_defaults: dict[str, Any] = {
@@ -441,65 +373,28 @@ class InteractionsApiTransport(ClientTransport):
                     AgentExtension(
                         uri=cls.EXTENSION_URI,
                         required=True,
-                        params=ext_params,
+                        params=agent_interaction,
                     )
                 ],
             ),
-            'name': f'Interactions API Agent: {agent_name}',
-            'description': 'Agent powered by Google Interactions API',
+            'name': cls._WELL_KNOWN_AGENTS_NAMES.get(agent_name, agent_name),
+            'description': cls._WELL_KNOWN_AGENTS_DESCRIPTIONS.get(
+                agent_name, 'Agent powered by Google Interactions API'
+            ),
             'default_input_modes': ['text/plain'],
             'default_output_modes': ['text/plain'],
-            'skills': [],
+            'skills': cls._WELL_KNOWN_AGENTS_SKILLS.get(agent_name, []),
             'version': '0.1.0',
         }
 
         # Apply overrides
         if agent_card_overrides:
-            # Handle capabilities and extensions merging if present in overrides
-            if 'capabilities' in agent_card_overrides:
-                # Create a mutable copy of the default capabilities for merging
-                merged_capabilities_dict = (
-                    card_defaults['capabilities'].model_dump()  # Use model_dump to get dict from Pydantic model
-                )
-                override_capabilities = agent_card_overrides['capabilities']
-
-                # Merge extensions: ensure our required extension is maintained
-                existing_extensions = merged_capabilities_dict.get('extensions', [])
-                override_extensions = override_capabilities.get('extensions', [])
-
-                # Filter out existing extension by our URI before adding it back
-                filtered_extensions = (
-                    [ext for ext in existing_extensions if ext.get('uri') != cls.EXTENSION_URI]
-                    if isinstance(existing_extensions, list)
-                    else []
-                )
-
-                # Add our generated extension
-                our_extension_dict = AgentExtension(
-                    uri=cls.EXTENSION_URI,
-                    required=True,
-                    params=ext_params,
-                ).model_dump()
-                filtered_extensions.append(our_extension_dict)  # Append our extension as a dict
-
-                # Add other extensions from overrides, avoiding duplicates of our URI
-                for ov_ext in override_extensions:
-                    if ov_ext.get('uri') != cls.EXTENSION_URI:  # Avoid duplicating our extension
-                        filtered_extensions.append(ov_ext)
-
-                override_capabilities['extensions'] = filtered_extensions
-
-                # Update merged_capabilities_dict with override capabilities
-                merged_capabilities_dict.update(override_capabilities)
-                card_defaults['capabilities'] = AgentCapabilities(**merged_capabilities_dict)
-
-            # Apply other top-level card overrides
             card_defaults.update(agent_card_overrides)
 
         return AgentCard(**card_defaults)
 
     @classmethod
-    def setup(cls, client_config: Any, client_factory: Any, api_key: str | None = None):
+    def setup(cls, client_config: ClientConfig, client_factory: ClientFactory, api_key: str | None = None):
         client_config.add_supported_transport('interactions-api')
         client_factory.register_transport_factory('interactions-api', lambda card: cls(card, api_key))
 
@@ -569,12 +464,13 @@ class InteractionsApiTransport(ClientTransport):
             'interaction': interaction_input['interaction'],
         }
         # Add root-level params if present in extension config
-        if self._agent_interaction.agent:
-            payload['agent'] = self._agent_interaction.agent
-        if self._agent_interaction.deep_research_config:
-            payload['deepResearchConfig'] = self._agent_interaction.deep_research_config
-        if self._agent_interaction.dynamic_config:
-            payload['dynamicConfig'] = self._agent_interaction.dynamic_config
+        # Add root-level params if present in extension config
+        if agent := self._agent_interaction.get('agent'):
+            payload['agent'] = agent
+        if deep_research_config := self._agent_interaction.get('deep_research_config'):
+            payload['deepResearchConfig'] = deep_research_config
+        if dynamic_config := self._agent_interaction.get('dynamic_config'):
+            payload['dynamicConfig'] = dynamic_config
 
         response = await self._make_request(
             'POST', f'/{self.INTERACTIONS_API_VERSION}/interactions:create', json_data=payload
@@ -690,12 +586,13 @@ class InteractionsApiTransport(ClientTransport):
             'interaction': interaction_input['interaction'],
         }
         # Add root-level params
-        if self._agent_interaction.agent:
-            payload['agent'] = self._agent_interaction.agent
-        if self._agent_interaction.deep_research_config:
-            payload['deepResearchConfig'] = self._agent_interaction.deep_research_config
-        if self._agent_interaction.dynamic_config:
-            payload['dynamicConfig'] = self._agent_interaction.dynamic_config
+        # Add root-level params if present in extension config
+        if agent := self._agent_interaction.get('agent'):
+            payload['agent'] = agent
+        if deep_research_config := self._agent_interaction.get('deep_research_config'):
+            payload['deepResearchConfig'] = deep_research_config
+        if dynamic_config := self._agent_interaction.get('dynamic_config'):
+            payload['dynamicConfig'] = dynamic_config
 
         async with self._client.stream(
             'POST',
