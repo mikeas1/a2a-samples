@@ -39,7 +39,6 @@ from a2a.types import (
     UnsupportedOperationError,
 )
 
-
 # --- Mapping Functions (Dict-based) ---
 
 
@@ -97,19 +96,19 @@ def _part_to_content(part: Part) -> dict[str, Any]:
     )
 
 
-def _a2a_message_to_interaction_input(message: Message, agent_interaction: dict[str, Any]) -> dict[str, Any]:
+def _a2a_request_to_interaction(message_params: MessageSendParams, agent_interaction: dict[str, Any]) -> dict[str, Any]:
     """Maps an A2A Message to the input structure for creating an Interaction."""
+    message = message_params.message
     interaction_data = {
         'contentList': {'contents': [_part_to_content(p) for p in message.parts]},
+        'agentInteraction': agent_interaction,
     }
+    if message_params.configuration:
+        interaction_data['background'] = not message_params.configuration.blocking
     if message.task_id:
         interaction_data['previousInteractionId'] = message.task_id
 
-    interaction_input = {
-        'interaction': interaction_data,
-        'agentInteraction': agent_interaction,
-    }
-    return interaction_input
+    return interaction_data
 
 
 def _interaction_status_to_a2a_task_state(status_str: str) -> TaskState:
@@ -125,16 +124,13 @@ def _interaction_status_to_a2a_task_state(status_str: str) -> TaskState:
     return mapping.get(status_str, TaskState.unknown)
 
 
-
 def _thought_to_message(thought_content: dict[str, Any]) -> Message:
     """Maps an Interactions API thought content to an A2A Message."""
     thought_parts: list[Part] = []
     summary = thought_content.get('summary', {})
     items = summary.get('items', [])
     for item in items:
-        if 'text' in item and 'text' in item['text']:
-            thought_parts.append(Part(root=TextPart(text=item['text']['text'])))
-        # Add logic for other content types within a thought if needed in the future
+        thought_parts.append(_content_to_part(item))
 
     if not thought_parts:
         raise A2AClientJSONRPCError(
@@ -145,7 +141,7 @@ def _thought_to_message(thought_content: dict[str, Any]) -> Message:
     return Message(message_id=str(uuid.uuid4()), role=Role.agent, parts=thought_parts)
 
 
-def _map_interactions_api_content_to_a2a_part(
+def _content_to_part(
     content: dict[str, Any],
 ) -> Part:
     """Maps an Interactions API Content dictionary to an A2A Part object (excluding thoughts)."""
@@ -186,16 +182,10 @@ def _map_interactions_api_content_to_a2a_part(
                 )
 
     if 'function' in content:
-        func_data = content['function']
-        # Handles functionCall wrapper if present
-        func_call = func_data.get('functionCall', func_data)
-        return Part(root=DataPart(data={'function_call': func_call}))
+        return Part(root=DataPart(data={'function_call': content['function']}))
 
     if 'functionResponse' in content:
-        func_res_wrapper = content['functionResponse']
-        # Handles functionResult wrapper if present
-        func_res_data = func_res_wrapper.get('functionResult', func_res_wrapper)
-        return Part(root=DataPart(data={'function_response': func_res_data}))
+        return Part(root=DataPart(data={'function_response': content['functionResponse']}))
 
     raise A2AClientJSONRPCError(
         JSONRPCErrorResponse(
@@ -204,6 +194,7 @@ def _map_interactions_api_content_to_a2a_part(
             )
         )
     )
+
 
 def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
     """Converts a raw Interactions API dictionary response to an A2A Task."""
@@ -216,6 +207,32 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
     a2a_history = []
     turn_list = interaction.get('turnList', {}).get('turns', [])
 
+    if 'content' in interaction:
+        a2a_history.append(
+            Message(
+                message_id='request', role=Role.user, parts=[_content_to_part(interaction['content'])], task_id=task_id
+            )
+        )
+    elif 'stringContent' in interaction:
+        a2a_history.append(
+            Message(
+                message_id='request',
+                role=Role.user,
+                parts=[Part(root=TextPart(text=interaction['stringContent']))],
+                task_id=task_id,
+            )
+        )
+    elif 'contentList' in interaction:
+        contents = interaction['contentList'].get('contents', [])
+        a2a_history.append(
+            Message(
+                message_id='request',
+                role=Role.user,
+                parts=[_content_to_part(content) for content in contents],
+                task_id=task_id,
+            )
+        )
+
     for i, turn in enumerate(turn_list):
         turn_role = Role.user if turn.get('role') == 'user' else Role.agent
         a2a_message_parts = []
@@ -224,7 +241,7 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
         if content_list:
             for content in content_list:
                 try:
-                    a2a_message_parts.append(_map_interactions_api_content_to_a2a_part(content))
+                    a2a_message_parts.append(_content_to_part(content))
                 except A2AClientJSONRPCError as e:
                     print(f'Warning: Skipping unsupported history content: {e}')
                     continue
@@ -244,7 +261,7 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
     a2a_artifacts = []
     thought_messages = []
     outputs = interaction.get('outputs', [])
-    
+
     for i, output_content in enumerate(outputs):
         if 'thought' in output_content:
             try:
@@ -256,7 +273,7 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
                 continue
         else:
             try:
-                a2a_part = _map_interactions_api_content_to_a2a_part(output_content)
+                a2a_part = _content_to_part(output_content)
                 a2a_artifacts.append(
                     Artifact(
                         artifact_id=f'{task_id}_output_{i}',
@@ -298,6 +315,7 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
 class InteractionsApiTransport(ClientTransport):
     INTERACTIONS_API_VERSION = 'v1beta'
     EXTENSION_URI = 'https://generativelanguage.googleapis.com/v1beta/a2a'
+    TRANSPORT_NAME = 'interactions-api'
 
     _WELL_KNOWN_AGENTS_INTERACTION_CONFIG: dict[str, dict[str, Any]] = {
         'deep-research-preview': {
@@ -328,19 +346,12 @@ class InteractionsApiTransport(ClientTransport):
         self._client.headers['x-goog-api-key'] = self._api_key
 
         # Extract agent_interaction from AgentCard extension
-        self._agent_interaction: dict[str, Any] = {}
-        if extension := find_extension_by_uri(self._card.capabilities.extensions, self.EXTENSION_URI):
-             if extension.params:
-                # Filter strictly for known fields if necessary, or just copy params
-                if 'agent' in extension.params:
-                    self._agent_interaction['agent'] = extension.params['agent']
-                if 'dynamic_config' in extension.params:
-                    self._agent_interaction['dynamic_config'] = extension.params['dynamic_config']
-                if 'deep_research_config' in extension.params:
-                    self._agent_interaction['deep_research_config'] = extension.params['deep_research_config']
-
-        # Internal state for streaming responses
-        self._streaming_tasks: dict[str, Task] = {}
+        extension = find_extension_by_uri(self._card, self.EXTENSION_URI)
+        if not extension or not extension.params:
+            raise ValueError(
+                'invalid AgentCard: missing required extension; use make_card to create a correctly formatted AgentCard'
+            )
+        self._agent_interaction: dict[str, Any] = extension.params['agentInteraction']
 
     @classmethod
     def make_card(
@@ -358,10 +369,10 @@ class InteractionsApiTransport(ClientTransport):
         agent_interaction: dict[str, Any] = {
             'agent': agent_name,
         }
-        if dynamic_config := final_agent_config.get('dynamic_config'):
-            agent_interaction['dynamic_config'] = dynamic_config
-        if deep_research_config := final_agent_config.get('deep_research_config'):
-            agent_interaction['deep_research_config'] = deep_research_config
+        if agent_name == 'deep-research-preview':
+            agent_interaction['deepResearchConfig'] = agent_config
+        else:
+            agent_interaction['dynamicConfig'] = agent_config
 
         # Default AgentCard values
         card_defaults: dict[str, Any] = {
@@ -373,7 +384,9 @@ class InteractionsApiTransport(ClientTransport):
                     AgentExtension(
                         uri=cls.EXTENSION_URI,
                         required=True,
-                        params=agent_interaction,
+                        params={
+                            'agentInteraction': agent_interaction,
+                        },
                     )
                 ],
             ),
@@ -395,8 +408,8 @@ class InteractionsApiTransport(ClientTransport):
 
     @classmethod
     def setup(cls, client_config: ClientConfig, client_factory: ClientFactory, api_key: str | None = None):
-        client_config.add_supported_transport('interactions-api')
-        client_factory.register_transport_factory('interactions-api', lambda card: cls(card, api_key))
+        client_config.supported_transports.append(cls.TRANSPORT_NAME)
+        client_factory.register(cls.TRANSPORT_NAME, lambda card, url, config, interceptors: cls(card, api_key))
 
     async def _make_request(
         self,
@@ -457,7 +470,7 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> Task | Message:
-        interaction_input = _a2a_message_to_interaction_input(request.message, self._agent_interaction)
+        interaction_input = _a2a_request_to_interaction(request, self._agent_interaction)
         payload = {
             'stream': False,
             'store': True,
@@ -544,7 +557,7 @@ class InteractionsApiTransport(ClientTransport):
                                 print(f'Warning: Skipping unsupported thought content in stream: {e}')
                         else:
                             try:
-                                a2a_part = _map_interactions_api_content_to_a2a_part(event_data)
+                                a2a_part = _content_to_part(event_data)
                                 yield TaskArtifactUpdateEvent(
                                     task_id=current_task.id,
                                     context_id=current_task.context_id,
@@ -579,7 +592,7 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> AsyncGenerator[Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
-        interaction_input = _a2a_message_to_interaction_input(request.message, self._agent_interaction)
+        interaction_input = _a2a_request_to_interaction(request.message, self._agent_interaction)
         payload = {
             'stream': True,
             'store': True,
