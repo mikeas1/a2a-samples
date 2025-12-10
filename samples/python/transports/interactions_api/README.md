@@ -19,9 +19,9 @@ The `InteractionsApiTransport` class (`interactions_api_transport.py`) allows an
 
 To use the `InteractionsApiTransport` class, your project requires the following dependencies:
 
-*   `a2a-sdk` (The Agent-to-Agent SDK)
-*   `httpx` (For making HTTP requests)
-*   `httpx-sse` (For handling Server-Sent Events / streaming)
+*   `a2a-sdk`
+*   `httpx`
+*   `httpx-sse`
 
 ### Usage
 
@@ -54,7 +54,7 @@ async for event in client.send_message(create_text_message_object('What is the w
 
 The local proxy server (`__main__.py`) is useful for testing and development. It allows you to expose the Interactions API as a standard A2A JSON-RPC endpoint.
 
-This is particularly helpful if you want to connect off-the-shelf A2A tools, debuggers, or GUIs to the Interactions API without them needing native support for the custom `interactions-api` transport.
+This is particularly helpful if you want to connect off-the-shelf A2A tools, inspectors, or GUIs to the Interactions API without them needing native support for the custom `interactions-api` transport.
 
 ### Key Files
 
