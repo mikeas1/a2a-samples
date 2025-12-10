@@ -6,8 +6,8 @@ This directory contains a sample implementation of a custom **A2A Client Transpo
 
 There are two main components in this package:
 
-1.  **`InteractionsApiTransport`**: A custom Python class that implements the A2A `ClientTransport` interface. It acts as a bridge, translating A2A client requests into HTTP calls compatible with the Google Interactions API.
-2.  **Local Proxy Server**: A standalone utility that spins up a local HTTP server. This server accepts standard A2A JSON-RPC requests (e.g., from tools, GUIs, or other agents) and proxies them through the `InteractionsApiTransport` to the Interactions API.
+1. **`InteractionsApiTransport`**: A custom Python class that implements the A2A `ClientTransport` interface. It acts as a bridge, translating A2A client requests into HTTP calls compatible with the Google Interactions API.
+2. **Local Proxy Server**: A standalone utility that spins up a local HTTP server. This server accepts standard A2A JSON-RPC requests (e.g., from tools, GUIs, or other agents) and proxies them through the `InteractionsApiTransport` to the Interactions API.
 
 ## 1. InteractionsApiTransport
 
@@ -19,9 +19,9 @@ The `InteractionsApiTransport` class (`interactions_api_transport.py`) allows an
 
 To use the `InteractionsApiTransport` class, your project requires the following dependencies:
 
-*   `a2a-sdk`
-*   `httpx`
-*   `httpx-sse`
+* `a2a-sdk`
+* `httpx`
+* `httpx-sse`
 
 ### Usage
 
@@ -58,17 +58,17 @@ This is particularly helpful if you want to connect off-the-shelf A2A tools, ins
 
 ### Key Files
 
-*   `interactions_api_transport.py`: The core transport implementation.
-*   `__main__.py`: The entry point for the local proxy server.
-*   `request_handler.py`: Handles incoming JSON-RPC requests and forwards them to the transport.
+* `interactions_api_transport.py`: The core transport implementation.
+* `__main__.py`: The entry point for the local proxy server.
+* `request_handler.py`: Handles incoming JSON-RPC requests and forwards them to the transport.
 
 ### Running the Proxy
 
-1.  **Install Dependencies:**
+1. **Install Dependencies:**
     It is recommended to use `uv` for dependency management and running the project. If you don't have `uv` installed, please refer to the [official uv documentation](https://docs.astral.sh/uv/) for installation instructions.
     `uv run .` will automatically install necessary packages according to the `pyproject.toml` file.
 
-2.  **Set Environment Variables:**
+2. **Set Environment Variables:**
     You need a valid API key. Create a `.env` file or export the variable:
     ```bash
     export GOOGLE_API_KEY="your_api_key_here"
@@ -76,7 +76,7 @@ This is particularly helpful if you want to connect off-the-shelf A2A tools, ins
     export GEMINI_API_KEY="your_api_key_here"
     ```
 
-3.  **Start the Server:**
+3. **Start the Server:**
     Run the module to start the proxy using `uv`:
     ```bash
     uv run .
@@ -85,9 +85,9 @@ This is particularly helpful if you want to connect off-the-shelf A2A tools, ins
     By default, it listens on `localhost:10000` and proxies to the `deep-research-pro-preview-12-2025` model.
 
     **Options:**
-    *   `--host`: Host to bind to (default: `localhost`).
-    *   `--port`: Port to listen on (default: `10000`).
-    *   `--model`: The Interactions API model/agent to use (default: `deep-research-pro-preview-12-2025`). Other valid options are:
+    * `--host`: Host to bind to (default: `localhost`).
+    * `--port`: Port to listen on (default: `10000`).
+    * `--model`: The Interactions API model/agent to use (default: `deep-research-pro-preview-12-2025`). Other valid options are:
         * gemini-3-pro-preview
         * gemini-2.5-pro
         * gemini-2.5-flash
@@ -99,5 +99,5 @@ This is particularly helpful if you want to connect off-the-shelf A2A tools, ins
     uv run . --model another-model-name
     ```
 
-4.  **Connect a Client:**
+4. **Connect a Client:**
     You can now connect any standard A2A client to `http://localhost:10000`. The proxy will handle the translation to the Interactions API.

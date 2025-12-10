@@ -4,11 +4,12 @@ import sys
 
 import click
 import uvicorn
+
 from a2a.server.apps import A2AStarletteApplication
 from dotenv import load_dotenv
-
 from interactions_api_transport import InteractionsApiTransport
 from request_handler import ClientTransportProxyRequestHandler
+
 
 load_dotenv()
 
@@ -28,16 +29,22 @@ def main(host, port, model):
     """Starts the Interactions API proxy server."""
     try:
         if not os.getenv('GOOGLE_API_KEY') and not os.getenv('GEMINI_API_KEY'):
-            raise MissingAPIKeyError('both GOOGLE_API_KEY and GEMINI_API_KEY environment variables not set.')
+            raise MissingAPIKeyError(
+                'both GOOGLE_API_KEY and GEMINI_API_KEY environment variables not set.'
+            )
 
         interactions_agent_card = InteractionsApiTransport.make_card(
             url='https://generativelanguage.googleapis.com',
             model=model,
         )
 
-        interaction_api_transport_object = InteractionsApiTransport(card=interactions_agent_card)
+        interaction_api_transport_object = InteractionsApiTransport(
+            card=interactions_agent_card
+        )
 
-        request_handler = ClientTransportProxyRequestHandler(transport=interaction_api_transport_object)
+        request_handler = ClientTransportProxyRequestHandler(
+            transport=interaction_api_transport_object
+        )
         exported_card = interactions_agent_card.model_copy(
             update={
                 'url': f'http://{host}:{port}',
@@ -45,7 +52,9 @@ def main(host, port, model):
             }
         )
 
-        server = A2AStarletteApplication(agent_card=exported_card, http_handler=request_handler)
+        server = A2AStarletteApplication(
+            agent_card=exported_card, http_handler=request_handler
+        )
 
         uvicorn.run(server.build(), host=host, port=port)
 

@@ -1,4 +1,5 @@
 import logging
+
 from collections.abc import AsyncGenerator
 
 from a2a.client.transports import ClientTransport
@@ -16,12 +17,11 @@ from a2a.types import (
     TaskPushNotificationConfig,
     TaskQueryParams,
 )
-from a2a.utils.telemetry import SpanKind, trace_class
+
 
 logger = logging.getLogger(__name__)
 
 
-@trace_class(kind=SpanKind.SERVER)
 class ClientTransportProxyRequestHandler(RequestHandler):
     """Request handler for all incoming requests to a ClientTransport.
 
@@ -43,7 +43,9 @@ class ClientTransportProxyRequestHandler(RequestHandler):
     ) -> Task | None:
         return await self._transport.get_task(params)
 
-    async def on_cancel_task(self, params: TaskIdParams, context: ServerCallContext | None = None) -> Task | None:
+    async def on_cancel_task(
+        self, params: TaskIdParams, context: ServerCallContext | None = None
+    ) -> Task | None:
         return await self._transport.cancel_task(params)
 
     async def on_message_send(

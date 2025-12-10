@@ -16,10 +16,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = [
-    "ruff",
-    "pyright",
-]
+dev = ["ruff", "pyright"]
 
 [tool.setuptools.packages.find]
 # Ensure that setuptools finds all packages under the current directory.
@@ -32,18 +29,3 @@ namespaces = false
 # If there are any non-python files that need to be included, specify them here.
 # For now, we don't have any, but it's good to have the section.
 "" = ["*.txt", "*.md"]
-
-[tool.ruff]
-line-length = 120
-indent-width = 4
-
-[tool.ruff.format]
-quote-style = "single"
-indent-style = "space"
-
-[tool.ruff.lint]
-select = ["E", "F", "W", "Q"]
-ignore = []
-
-[tool.ruff.lint.flake8-quotes]
-inline-quotes = "single"
