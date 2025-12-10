@@ -8,7 +8,7 @@ from a2a.server.apps import A2AStarletteApplication
 from dotenv import load_dotenv
 
 from interactions_api_transport import InteractionsApiTransport
-from request_handler import InteractionsAPIProxyRequestHandler
+from request_handler import ClientTransportProxyRequestHandler
 
 load_dotenv()
 
@@ -23,36 +23,21 @@ class MissingAPIKeyError(Exception):
 @click.command()
 @click.option('--host', 'host', default='localhost')
 @click.option('--port', 'port', default=10000)
-def main(host, port):
+@click.option('--model', 'model', default='deep-research-pro-preview-12-2025')
+def main(host, port, model):
     """Starts the Interactions API proxy server."""
     try:
         if not os.getenv('GOOGLE_API_KEY') and not os.getenv('GEMINI_API_KEY'):
             raise MissingAPIKeyError('both GOOGLE_API_KEY and GEMINI_API_KEY environment variables not set.')
 
         interactions_agent_card = InteractionsApiTransport.make_card(
-            url='https://preprod-generativelanguage.googleapis.com',
-            model='gemini-3-pro-preview',
-            request_opts={
-                # 'generation_config': {'thinking_summaries': 'none'},
-            },
-            # agent_card_overrides={
-            #     'skills': [
-            #         AgentSkill(
-            #             id='completion',
-            #             name='Completion',
-            #             description='Get completions for a given request',
-            #             examples=['Hello'],
-            #             input_modes=['text/plain'],
-            #             output_modes=['text/plain'],
-            #             tags=['completion'],
-            #         )
-            #     ]
-            # },
+            url='https://generativelanguage.googleapis.com',
+            model=model,
         )
 
         interaction_api_transport_object = InteractionsApiTransport(card=interactions_agent_card)
 
-        request_handler = InteractionsAPIProxyRequestHandler(transport=interaction_api_transport_object)
+        request_handler = ClientTransportProxyRequestHandler(transport=interaction_api_transport_object)
         exported_card = interactions_agent_card.model_copy(
             update={
                 'url': f'http://{host}:{port}',
