@@ -47,47 +47,47 @@ from a2a.types import (
 def _part_to_content(part: Part) -> dict[str, Any]:
     """Maps an A2A Part object to an Interactions API Content dictionary."""
     if isinstance(part.root, TextPart):
-        content = {'text': part.root.text}
+        content = {'text': part.root.text, 'type': 'text'}
         if part.root.metadata and (annotations := part.root.metadata.get('annotations')):
             content['annotations'] = annotations
-        return {'text': content}
+        return content
     elif isinstance(part.root, FilePart):
-        mime_type = None
+        mime_type = part.root.file.mime_type
+        if not mime_type:
+            raise ValueError('FilePart must have a mime_type when using interactions API')
         blob_content = {}
 
         if isinstance(part.root.file, FileWithBytes):
             blob_content['data'] = part.root.file.bytes
-            mime_type = part.root.file.mime_type
         elif isinstance(part.root.file, FileWithUri):
             blob_content['uri'] = part.root.file.uri
-            mime_type = part.root.file.mime_type
 
         if part.root.metadata:
             resolution = part.root.metadata.get('resolution')
             if resolution:
                 blob_content['resolution'] = resolution
 
-        if mime_type:
-            blob_content['mime_type'] = mime_type
-            if mime_type.startswith('image'):
-                return {'image': blob_content}
-            elif mime_type.startswith('audio'):
-                return {'audio': blob_content}
-            elif mime_type.startswith('application/pdf'):
-                return {'document': blob_content}
-            elif mime_type.startswith('video'):
-                return {'video': blob_content}
-            else:
-                raise A2AClientJSONRPCError(
-                    JSONRPCErrorResponse(
-                        error=ContentTypeNotSupportedError(
-                            message=f'Unsupported file MIME type for Interactions API mapping: {mime_type}'
-                        )
+        blob_content['mime_type'] = mime_type
+        if mime_type.startswith('image'):
+            blob_content['type'] = 'image'
+        elif mime_type.startswith('audio'):
+            blob_content['type'] = 'audio'
+        elif mime_type.startswith('application/pdf'):
+            blob_content['type'] = 'document'
+        elif mime_type.startswith('video'):
+            blob_content['type'] = 'video'
+        else:
+            raise A2AClientJSONRPCError(
+                JSONRPCErrorResponse(
+                    error=ContentTypeNotSupportedError(
+                        message=f'Unsupported file MIME type for Interactions API mapping: {mime_type}'
                     )
                 )
+            )
+        return blob_content
 
     elif isinstance(part.root, DataPart):
-        return {'text': {'text': json.dumps(part.root.data)}}
+        return {'text': json.dumps(part.root.data), 'type': 'text'}
 
     raise A2AClientJSONRPCError(
         JSONRPCErrorResponse(
@@ -107,23 +107,35 @@ def _a2a_request_to_interaction(
         'input': [_part_to_content(p) for p in message.parts],
         'stream': stream,
         'store': True,
-        'background': True,
+        # Background execution only works for agents
+        'background': 'agent' in base_request,
     }
     if message.task_id:
         request['previous_interaction_id'] = message.task_id
+    elif message.reference_task_ids:
+        request['previous_interaction_id'] = message.reference_task_ids[0]
+    if message_params.configuration and message_params.configuration.accepted_output_modes:
+        modalities = set()
+        for mode in message_params.configuration.accepted_output_modes:
+            if mode.startswith('text/'):
+                modalities.add('text')
+            elif mode.startswith('image/'):
+                modalities.add('image')
+            elif mode.startswith('audio/'):
+                modalities.add('audio')
+        request['response_modalities'] = list(modalities)
     request.update(base_request)
-    return base_request
+    return request
 
 
 def _interaction_status_to_a2a_task_state(status_str: str) -> TaskState:
     """Maps Interactions API status string to A2A TaskState."""
     mapping = {
-        'UNSPECIFIED': TaskState.unknown,
-        'IN_PROGRESS': TaskState.working,
-        'REQUIRES_ACTION': TaskState.input_required,
-        'COMPLETED': TaskState.completed,
-        'FAILED': TaskState.failed,
-        'CANCELLED': TaskState.canceled,
+        'in_progress': TaskState.working,
+        'requires_action': TaskState.input_required,
+        'completed': TaskState.completed,
+        'failed': TaskState.failed,
+        'cancelled': TaskState.canceled,
     }
     return mapping.get(status_str, TaskState.unknown)
 
@@ -193,9 +205,9 @@ def _content_to_part(
 def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
     """Converts a raw Interactions API dictionary response to an A2A Task."""
     task_id = interaction.get('id', '')
+    print(f'Received Interaction: {json.dumps(interaction)}')
 
-    status_obj = interaction.get('status', {})
-    status_str = status_obj.get('status', 'UNSPECIFIED')
+    status_str = interaction.get('status', 'UNSPECIFIED')
     task_status_state = _interaction_status_to_a2a_task_state(status_str)
 
     a2a_history = []
@@ -257,7 +269,7 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
     task_status_message: Message | None = None
 
     # Error handling overrides thought status
-    error_obj = interaction.get('error') or status_obj.get('error')
+    error_obj = interaction.get('error')
     if error_obj:
         task_status_message = Message(
             message_id='error',
@@ -267,7 +279,7 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
 
     return Task(
         id=task_id,
-        context_id=task_id,
+        context_id='',
         status=TaskStatus(state=task_status_state, message=task_status_message),
         artifacts=a2a_artifacts if a2a_artifacts else None,
         history=a2a_history if a2a_history else None,
@@ -279,21 +291,14 @@ class InteractionsApiTransport(ClientTransport):
     EXTENSION_URI = 'https://generativelanguage.googleapis.com/v1beta/a2a'
     TRANSPORT_NAME = 'interactions-api'
 
-    _WELL_KNOWN_AGENTS_INTERACTION_CONFIG: dict[str, dict[str, Any]] = {
-        'deep-research-preview': {
-            'deep_research_config': {
-                'thinking_summaries': 'THINK_SUMMARIES_AUTO',
-            },
-        },
-    }
     _WELL_KNOWN_AGENTS_NAMES: dict[str, str] = {
-        'deep-research-preview': 'Deep Research Preview',
+        'deep-research-pro-preview-12-2025': 'Deep Research Preview',
     }
     _WELL_KNOWN_AGENTS_DESCRIPTIONS: dict[str, str] = {
-        'deep-research-preview': 'Agent powered by Google Deep Research Preview',
+        'deep-research-pro-preview-12-2025': 'Agent powered by Google Deep Research Preview',
     }
     _WELL_KNOWN_AGENTS_SKILLS: dict[str, list[AgentSkill]] = {
-        'deep-research-preview': [
+        'deep-research-pro-preview-12-2025': [
             AgentSkill(
                 id='research',
                 name='Deep Research',
@@ -331,13 +336,27 @@ class InteractionsApiTransport(ClientTransport):
     def make_card(
         cls,
         url: str,
-        agent_name: str,
-        base_request: dict[str, Any] | None = None,
+        agent: str | None = None,
+        model: str | None = None,
+        request_opts: dict[str, Any] | None = None,
         agent_card_overrides: dict[str, Any] | None = None,
     ) -> AgentCard:
         # Default AgentCard values
-        base_request = base_request or {}
-        base_request['agent'] = agent_name
+        request = {}
+        agent_name: str = ''
+        if agent:
+            request['agent'] = agent
+            agent_name = agent
+        elif model:
+            if model in cls._WELL_KNOWN_AGENTS_NAMES:
+                request['agent'] = model
+            else:
+                request['model'] = model
+            agent_name = model
+        else:
+            raise ValueError('either agent or model parameter must be specified')
+        if request_opts:
+            request.update(request_opts)
         card = AgentCard(
             url=url,
             preferred_transport='interactions-api',
@@ -347,15 +366,28 @@ class InteractionsApiTransport(ClientTransport):
                     AgentExtension(
                         uri=cls.EXTENSION_URI,
                         required=True,
-                        params=base_request,
-                    )
+                        params=request,
+                    ),
                 ],
             ),
             name=cls._WELL_KNOWN_AGENTS_NAMES.get(agent_name, agent_name),
             description=cls._WELL_KNOWN_AGENTS_DESCRIPTIONS.get(agent_name, 'Agent powered by Google Interactions API'),
             default_input_modes=['text/plain'],
             default_output_modes=['text/plain'],
-            skills=cls._WELL_KNOWN_AGENTS_SKILLS.get(agent_name, []),
+            skills=cls._WELL_KNOWN_AGENTS_SKILLS.get(
+                agent_name,
+                [
+                    AgentSkill(
+                        id='interact',
+                        name='Interact',
+                        input_modes=['text/plain'],
+                        output_modes=['text/plain'],
+                        description='Interact with the agent',
+                        examples=['What is 2+2?'],
+                        tags=[],
+                    )
+                ],
+            ),
             version='v1beta',
         )
 
@@ -370,7 +402,7 @@ class InteractionsApiTransport(ClientTransport):
         client_config.supported_transports.append(cls.TRANSPORT_NAME)
         client_factory.register(cls.TRANSPORT_NAME, lambda card, url, config, interceptors: cls(card, api_key))
 
-    async def _make_request(
+    async def _do_request(
         self,
         method: str,
         path: str,
@@ -378,21 +410,28 @@ class InteractionsApiTransport(ClientTransport):
         params: dict[str, Any] | None = None,
         stream: bool = False,
     ) -> httpx.Response:
+        headers = {'Content-Type': 'application/json'}
+        if stream:
+            headers['Accept'] = 'text/event-stream'
+
+        if method == 'POST':
+            response = await self._client.post(path, json=json_data, params=params, headers=headers, timeout=None)
+        elif method == 'GET':
+            response = await self._client.get(path, params=params, headers=headers, timeout=None)
+        else:
+            raise ValueError(f'Unsupported HTTP method: {method}')
+
+        await self._translate_response_error(response)
+        return response
+
+    async def _translate_response_error(
+        self,
+        response: httpx.Response,
+    ):
         try:
-            headers = {'Content-Type': 'application/json'}
-            if stream:
-                headers['Accept'] = 'text/event-stream'
-
-            if method == 'POST':
-                response = await self._client.post(path, json=json_data, params=params, headers=headers, timeout=None)
-            elif method == 'GET':
-                response = await self._client.get(path, params=params, headers=headers, timeout=None)
-            else:
-                raise ValueError(f'Unsupported HTTP method: {method}')
-
             response.raise_for_status()
-            return response
         except httpx.HTTPStatusError as e:
+            await e.response.aread()
             if e.response.status_code == 400:
                 raise A2AClientJSONRPCError(
                     JSONRPCErrorResponse(
@@ -430,7 +469,7 @@ class InteractionsApiTransport(ClientTransport):
         extensions: list[str] | None = None,
     ) -> Task | Message:
         body = _a2a_request_to_interaction(request, stream=False, base_request=self._base_request)
-        response = await self._make_request('POST', f'/{self.INTERACTIONS_API_VERSION}/interactions', json_data=body)
+        response = await self._do_request('POST', f'/{self.INTERACTIONS_API_VERSION}/interactions', json_data=body)
         return convert_interaction_to_task(response.json())
 
     def _process_event(
@@ -472,7 +511,7 @@ class InteractionsApiTransport(ClientTransport):
                 # This should have been setup above.
                 current_status_message = current_task.status.message
                 current_status_message.parts.append(  # type: ignore
-                    _content_to_part(event_data['delta']['conent'])
+                    _content_to_part(event_data['delta']['content'])
                 )
                 return TaskStatusUpdateEvent(
                     task_id=current_task.id,
@@ -541,14 +580,15 @@ class InteractionsApiTransport(ClientTransport):
         extensions: list[str] | None = None,
     ) -> AsyncGenerator[Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
         body = _a2a_request_to_interaction(request, stream=True, base_request=self._base_request)
-
+        print(f'Sending request: {json.dumps(body)}')
         async with httpx_sse.aconnect_sse(
             self._client,
             'POST',
             f'/{self.INTERACTIONS_API_VERSION}/interactions',
             json=body,
+            timeout=None,
         ) as event_source:
-            event_source.response.raise_for_status()
+            await self._translate_response_error(event_source.response)
             stream = event_source.aiter_sse()
             first_event = await anext(stream)
             if first_event.event == 'error':
@@ -570,7 +610,7 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> Task:
-        response = await self._make_request('GET', f'/{self.INTERACTIONS_API_VERSION}/interactions/{request.id}')
+        response = await self._do_request('GET', f'/{self.INTERACTIONS_API_VERSION}/interactions/{request.id}')
         return convert_interaction_to_task(response.json())
 
     async def cancel_task(
@@ -580,13 +620,8 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> Task:
-        raise A2AClientJSONRPCError(
-            JSONRPCErrorResponse(
-                error=UnsupportedOperationError(
-                    message='Task cancellation not supported by Interactions API transport.'
-                )
-            )
-        )
+        response = await self._do_request('POST', f'/{self.INTERACTIONS_API_VERSION}/interactions/{request.id}/cancel')
+        return convert_interaction_to_task(response.json())
 
     async def set_task_callback(
         self,
@@ -625,30 +660,36 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> AsyncGenerator[Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
-        # Snapshot the current state of the Task, then subscribe.
-        current_task = await self.get_task(TaskQueryParams(id=request.id))
-        yield current_task
+        # Resubscribing has two different behaviors: if a model,
         async with httpx_sse.aconnect_sse(
             self._client,
             'GET',
             f'/{self.INTERACTIONS_API_VERSION}/interactions/{request.id}',
             params={'stream': True},
+            timeout=None,
         ) as event_source:
-            event_source.response.raise_for_status()
+            await self._translate_response_error(event_source.response)
             stream = event_source.aiter_sse()
             first_event = await anext(stream)
             if first_event.event == 'error':
                 event_data = first_event.json()
-                if event_data['code'] == 'not_found':
-                    # If a task is complete, Interactions API returns an error
-                    # when trying to stream. A2A always returns the state of the
-                    # Task then stops streaming.
+                if event_data['error']['code'] == 'not_found':
+                    # Models behave differently from agents in the interactions
+                    # API. If you attempt to resubscribe to model output that
+                    # has completed, you get an error. We can just fetch the
+                    # final state of the interaction and yield that.
+                    current_task = await self.get_task(TaskQueryParams(id=request.id))
+                    yield current_task
                     return
+                # Otherwise raise the error.
                 raise A2AClientError(first_event.data)
-            thought_indexes = set()
-            if processed := self._process_event(first_event, current_task, thought_indexes):
-                yield processed
-            async for event in self._process_stream(stream, current_task, thought_indexes):
+            if first_event.event == 'interaction.start':
+                current_task = convert_interaction_to_task(first_event.json()['interaction'])
+                current_task.status.state = TaskState.submitted
+                yield current_task
+            else:
+                raise A2AClientError(f'unexpected first event type: {first_event.event}')
+            async for event in self._process_stream(stream, current_task, set()):
                 yield event
 
     async def get_card(
